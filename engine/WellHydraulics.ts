@@ -1,35 +1,124 @@
 import { Segment, CalculationResults, SegmentResult, CalculationParams } from '../types';
-import { 
-  GRAVITY, PI, LAMINAR_FLOW_LIMIT, TURBULENT_FLOW_START, SECONDS_PER_DAY, ENTRY_LOSS_COEFFICIENT, DEFAULT_OPEN_HOLE_ROUGHNESS 
+import {
+  GRAVITY, PI, LAMINAR_FLOW_LIMIT, TURBULENT_FLOW_START, SECONDS_PER_DAY, ENTRY_LOSS_COEFFICIENT, DEFAULT_OPEN_HOLE_ROUGHNESS
 } from '../constants/physics';
 
+/**
+ * Well Hydraulics Calculation Engine
+ *
+ * Implements fluid dynamics calculations for disposal well injection systems
+ * based on industry-standard equations and API RP 14E guidelines.
+ *
+ * References:
+ * - Darcy-Weisbach equation for friction losses
+ * - Swamee-Jain equation for turbulent friction factor
+ * - API RP 14E: Recommended Practice for Design and Installation of Offshore Production Platform Piping Systems
+ * - Moody diagram for friction factor determination
+ */
 export class WellHydraulics {
+  /**
+   * Calculates Reynolds number for pipe flow
+   *
+   * Re = (ρ × V × D) / μ
+   *
+   * @param velocity - Flow velocity in m/s
+   * @param diameter - Pipe inner diameter in m
+   * @param density - Fluid density in kg/m³
+   * @param viscosity - Dynamic viscosity in Pa·s
+   * @returns Reynolds number (dimensionless)
+   *
+   * Flow regimes:
+   * - Re < 2300: Laminar flow
+   * - 2300 ≤ Re < 4000: Transitional flow
+   * - Re ≥ 4000: Turbulent flow
+   */
   static calculateReynolds(velocity: number, diameter: number, density: number, viscosity: number): number {
     if (viscosity === 0 || diameter === 0) return 0;
     return (density * velocity * diameter) / viscosity;
   }
 
+  /**
+   * Calculates friction factor for turbulent flow using Swamee-Jain equation
+   *
+   * Swamee-Jain equation (explicit approximation of Colebrook-White):
+   * f = 0.25 / [log₁₀(ε/(3.7×D) + 5.74/Re^0.9)]²
+   *
+   * Valid for: 4000 < Re < 10⁸ and 10⁻⁶ < ε/D < 10⁻²
+   * Accuracy: ±1% compared to implicit Colebrook-White equation
+   *
+   * @param Re - Reynolds number (dimensionless)
+   * @param relativeRoughness - Pipe roughness ε/D (dimensionless)
+   * @returns Darcy friction factor (dimensionless)
+   *
+   * Reference: Swamee, P.K. and Jain, A.K. (1976)
+   * "Explicit Equations for Pipe-Flow Problems"
+   */
   private static calculateTurbulentFriction(Re: number, relativeRoughness: number): number {
     const effectiveRoughness = Math.max(relativeRoughness, 1e-10);
-    // Swamee-Jain equation - explicit and accurate for turbulent flow
+    // Swamee-Jain constants: 3.7, 5.74, 0.9, 0.25
     const logTerm = Math.log10((effectiveRoughness / 3.7) + (5.74 / Math.pow(Re, 0.9)));
     const f = 0.25 / Math.pow(logTerm, 2);
     return f;
   }
-  
+
+  /**
+   * Calculates Darcy friction factor based on flow regime
+   *
+   * Implements three flow regimes:
+   * 1. Laminar (Re < 2300): f = 64/Re (Hagen-Poiseuille)
+   * 2. Transitional (2300 ≤ Re < 4000): Linear interpolation
+   * 3. Turbulent (Re ≥ 4000): Swamee-Jain equation
+   *
+   * @param Re - Reynolds number (dimensionless)
+   * @param relativeRoughness - Pipe roughness ε/D (dimensionless)
+   * @returns Darcy friction factor (dimensionless)
+   *
+   * The transitional regime uses linear interpolation as a practical
+   * approximation, as exact behavior in this range is complex and
+   * depends on many factors.
+   */
   static calculateFrictionFactor(Re: number, relativeRoughness: number): number {
     if (Re <= 0) return 0;
+
+    // Laminar flow: f = 64/Re
     if (Re < LAMINAR_FLOW_LIMIT) return 64 / Re;
+
+    // Transitional flow: linear interpolation
     if (Re >= LAMINAR_FLOW_LIMIT && Re < TURBULENT_FLOW_START) {
-      // Linear interpolation for transitional flow
       const laminarF = 64 / LAMINAR_FLOW_LIMIT;
       const turbulentF = this.calculateTurbulentFriction(TURBULENT_FLOW_START, relativeRoughness);
       const fraction = (Re - LAMINAR_FLOW_LIMIT) / (TURBULENT_FLOW_START - LAMINAR_FLOW_LIMIT);
       return laminarF + fraction * (turbulentF - laminarF);
     }
+
+    // Turbulent flow: Swamee-Jain equation
     return this.calculateTurbulentFriction(Re, relativeRoughness);
   }
-  
+
+  /**
+   * Calculates pressure drop and flow characteristics for disposal well injection
+   *
+   * Performs comprehensive hydraulic analysis including:
+   * - Friction losses using Darcy-Weisbach equation: ΔP = f × (L/D) × (ρV²/2)
+   * - Hydrostatic pressure gain: ΔP = ρ × g × h
+   * - Minor losses (entry, contractions, expansions)
+   * - Flow regime determination for each segment
+   * - Maximum achievable flow rate estimation
+   *
+   * @param params - Calculation parameters including geometry, pressures, and fluid properties
+   * @returns Detailed calculation results with segment-by-segment analysis and warnings
+   *
+   * Key assumptions:
+   * - Incompressible flow (valid for liquids)
+   * - Steady-state conditions
+   * - Fully developed flow in each segment
+   * - Newtonian fluid behavior
+   *
+   * References:
+   * - Darcy-Weisbach equation for friction losses
+   * - API RP 14E for erosion velocity limits
+   * - Crane TP-410 for minor loss coefficients
+   */
   public static calculatePressureDrop(params: CalculationParams): CalculationResults {
     const { 
       segments, flowRate, injectionPressure, bottomholePressure, 
